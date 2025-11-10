@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Resume Ranker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-zinc-900 text-slate-300 font-sans antialiased">
+    <div id="root"></div>
+    <script type="text/babel">
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+        const { useState, useEffect } = React;
+
+        const readTxtFile = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (event) => resolve(event.target.result);
+                reader.onerror = (error) => reject(error);
+                reader.readAsText(file);
+            });
+        };
+
+        const readDocxFile = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    mammoth.extractRawText({ arrayBuffer: event.target.result })
+                        .then(result => resolve(result.value))
+                        .catch(reject);
+                };
+                reader.onerror = (error) => reject(error);
+                reader.readAsArrayBuffer(file);
+            });
+        };
+
+        const readPdfFile = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const loadingTask = pdfjsLib.getDocument({ data: event.target.result });
+                    loadingTask.promise.then(pdf => {
+                        let fullText = "";
+                        const numPages = pdf.numPages;
+                        const pagePromises = [];
+                        for (let i = 1; i <= numPages; i++) {
+                            pagePromises.push(
+                                pdf.getPage(i).then(page => {
+                                    return page.getTextContent().then(textContent => {
+                                        return textContent.items.map(item => item.str).join(" ");
+                                    });
+                                })
+                            );
+                        }
+                        Promise.all(pagePromises)
+                            .then(pageTexts => {
+                                resolve(pageTexts.join("\n"));
+                            })
+                            .catch(reject);
+                    }).catch(reject);
+                };
+                reader.onerror = (error) => reject(error);
+                reader.readAsArrayBuffer(file);
+            });
+        };
+
+        function App() {
+            const [jdText, setJdText] = useState("");
+            const [files, setFiles] = useState([]);
+            const [rankedResults, setRankedResults] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState(null);
+
+            const handleRankClick = async () => {
+                if (!jdText) {
+                    setError("Please paste a Job Description.");
+                    return;
+                }
+                if (files.length === 0) {
+                    setError("Please upload at least one resume.");
+                    return;
+                }
+
+                setIsLoading(true);
+                setError(null);
+                setRankedResults([]);
+
+                try {
+                    const fileReadPromises = files.map(file => {
+                        const extension = file.name.split('.').pop().toLowerCase();
+                        let readPromise;
+                        switch (extension) {
+                            case 'txt':
+                                readPromise = readTxtFile(file);
+                                break;
+                            case 'docx':
+                                readPromise = readDocxFile(file);
+                                break;
+                            case 'pdf':
+                                readPromise = readPdfFile(file);
+                                break;
+                            default:
+                                console.warn(`Skipping unsupported file: ${file.name}`);
+                                readPromise = Promise.resolve(null);
+                        }
+                        return readPromise.then(text => ({
+                            filename: file.name,
+                            text: text
+                        })).catch(err => {
+                            console.error(`Failed to read ${file.name}:`, err);
+                            return { filename: file.name, text: null };
+                        });
+                    });
+
+                    const resumeData = await Promise.all(fileReadPromises);
+                    const validResumes = resumeData.filter(r => r.text);
+                    if(validResumes.length === 0) {
+                        throw new Error("Could not successfully read any of the uploaded files.");
+                    }
+
+                    const apiPayload = {
+                        jd_text: jdText,
+                        resumes: validResumes
+                    };
+
+                    const response = await fetch("http://127.0.0.1:8000/rank", {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(apiPayload)
+                    });
+
+                    if (!response.ok) {
+                        const errData = await response.json();
+                        throw new Error(errData.detail || `API request failed with status ${response.status}`);
+                    }
+
+                    const results = await response.json();
+                    if (results.ranked_resumes) {
+                        setRankedResults(results.ranked_resumes);
+                    } else {
+                        throw new Error("Invalid response from API.");
+                    }
+
+                } catch (err) {
+                    console.error("Ranking error:", err);
+                    let userErrorMessage = err.message;
+                    if (err instanceof TypeError && err.message === "Failed to fetch") {
+                        userErrorMessage = "Could not connect to the backend. This is usually a 'CORS' issue.\n\n" +
+                                           "**HOW TO FIX:**\n" +
+                                           "1. Stop your backend server (Ctrl+C).\n" +
+                                           "2. Open your `backend_api.py` file.\n" +
+                                           "3. Add `from fastapi.middleware.cors import CORSMiddleware` to the top.\n" +
+                                           "4. Add these lines right after `app = FastAPI()`:\n\n" +
+                                           "app.add_middleware(\n" +
+                                           "    CORSMiddleware,\n" +
+                                           "    allow_origins=[\"*\"],\n" +
+                                           "    allow_credentials=True,\n" +
+                                           "    allow_methods=[\"*\"],\n" +
+                                           "    allow_headers=[\"*\"],\n" +
+                                           ")\n\n" +
+                                           "5. Make sure your backend server is running, then try again.";
+                    }
+                    setError(userErrorMessage);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const handleFileChange = (e) => {
+                if (e.target.files) {
+                    setFiles(Array.from(e.target.files));
+                }
+            };
+
+            return (
+                <div className="container mx-auto p-4 md:p-8 max-w-7xl min-h-screen">
+                    <header className="text-center mb-10">
+                        <h1 className="text-4xl font-bold text-white">
+                            Resume Ranker
+                        </h1>
+                        <p className="text-lg text-slate-400 mt-2">
+                            Please enter the Job Description and upload the resume files.
+                        </p>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+                        <div className="bg-zinc-800 p-6 rounded-lg shadow-xl flex flex-col">
+                            <h2 className="text-2xl font-semibold text-slate-100 mb-4">1. Job Description</h2>
+                            <textarea
+                                className="w-full flex-grow h-96 p-3 border border-zinc-700 bg-zinc-900 rounded-md shadow-sm 
+                                         focus:outline-none focus:ring-2 focus:ring-amber-500 text-slate-100"
+                                placeholder="Paste the full job description here..."
+                                value={jdText}
+                                onChange={(e) => setJdText(e.target.value)}
+                                disabled={isLoading}
+                            ></textarea>
+                        </div>
+
+                        <div className="bg-zinc-800 p-6 rounded-lg shadow-xl flex flex-col">
+                            <h2 className="text-2xl font-semibold text-slate-100 mb-4">2. Upload Resumes</h2>
+                            <label
+                                htmlFor="file-upload"
+                                className={`flex flex-col items-center justify-center w-full h-64 border-2 border-zinc-700 
+                                          border-dashed rounded-lg cursor-pointer bg-zinc-900 
+                                          hover:bg-zinc-700/50 transition-colors
+                                          ${isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                                <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                                    <svg className="w-10 h-10 mb-4 text-slate-500" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 16">
+                                        <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"/>
+                                    </svg>
+                                    <p className="mb-2 text-sm text-slate-400"><span className="font-semibold">Click to upload</span> or drag and drop</p>
+                                    <p className="text-xs text-slate-500">PDF, DOCX, or TXT</p>
+                                </div>
+                                <input 
+                                    id="file-upload" 
+                                    type="file" 
+                                    multiple 
+                                    className="hidden" 
+                                    accept=".pdf,.docx,.txt"
+                                    onChange={handleFileChange} 
+                                    disabled={isLoading} 
+                                />
+                            </label>
+
+                            {files.length > 0 && (
+                                <div className="mt-4">
+                                    <p className="font-semibold text-slate-300">Selected files:</p>
+                                    <ul className="list-disc list-inside mt-2 text-sm text-slate-400 max-h-24 overflow-y-auto">
+                                        {files.map(file => <li key={file.name}>{file.name}</li>)}
+                                    </ul>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="text-center mb-8">
+                        <button
+                            className="w-full md:w-1/2 bg-amber-600 text-white font-bold py-3 px-6 rounded-lg shadow-lg
+                                     hover:bg-amber-700 transition duration-300 ease-in-out
+                                     disabled:bg-slate-600 disabled:cursor-not-allowed
+                                     flex items-center justify-center mx-auto"
+                            onClick={handleRankClick}
+                            disabled={isLoading}
+                        >
+                            {isLoading ? (
+                                <>
+                                    <div className="loader mr-3"></div>
+                                    <span>Ranking...</span>
+                                </>
+                            ) : (
+                                "Rank Resumes"
+                            )}
+                        </button>
+                    </div>
+
+                    <div>
+                        {error && (
+                            <div className="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded-lg shadow-md" role="alert">
+                                <strong className="font-bold">Error: </strong>
+                                <span className="block sm:inline whitespace-pre-wrap">{error}</span>
+                            </div>
+                        )}
+
+                        {rankedResults.length > 0 && (
+                            <div className="bg-zinc-800 p-6 rounded-lg shadow-xl">
+                                <h2 className="text-2xl font-semibold text-slate-100 mb-4">Results</h2>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full min-w-full table-auto border-collapse">
+                                        <thead>
+                                            <tr className="bg-zinc-700 text-left">
+                                                <th className="p-3 font-semibold text-slate-300 uppercase text-sm">Rank</th>
+                                                <th className="p-3 font-semibold text-slate-300 uppercase text-sm">Filename</th>
+                                                <th className="p-3 font-semibold text-slate-300 uppercase text-sm">Match Score</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {rankedResults.map((result, index) => (
+                                                <tr key={index} className="border-b border-zinc-700 hover:bg-zinc-700/50 transition-colors">
+                                                    <td className="p-3 font-bold text-lg text-amber-400">{index + 1}</td>
+                                                    <td className="p-3 text-slate-300">{result.filename}</td>
+                                                    <td className="p-3 text-slate-100 font-medium">
+                                                        {(result.score * 100).toFixed(1)}%
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
